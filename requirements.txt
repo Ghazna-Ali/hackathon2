@@ -1,6 +1,17 @@
-streamlit
-crewai[google-genai]
-crewai-tools
+streamlit>=1.38
+pandas
+langchain
+langchain-community
+langchain-text-splitters
+langchain-google-genai
+langchain-huggingface
+langchain-chroma
+langgraph
+chromadb
 pypdf
-requests
-beautifulsoup4
+sentence-transformers
+# Streamlit Cloud ships an old sqlite3 that Chroma rejects; this fixes it
+pysqlite3-binary
+# Optional: only needed if you set LLM_PROVIDER = "groq"
+# langchain-groq
+ 
