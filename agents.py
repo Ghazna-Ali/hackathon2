@@ -1,257 +1,194 @@
-import os
-import streamlit as st
-from crewai import Agent, LLM
+"""Agents + LangGraph workflow.
 
+Flow:
+START -> Job Analyst -> CV Analyst -> Job Match Score -> Skill Gap Detector
+      -> Matching Agent -> Application Agent (profile + cover letter)
+      -> Manager Agent (career roadmap) -> Reviewer -> END
+"""
+import json
+import re
+from typing import Any, TypedDict
 
-# ============================================================
-# GEMINI API KEY
-# ============================================================
+from langgraph.graph import END, START, StateGraph
 
-def get_gemini_api_key():
-    """
-    Get the Gemini API key.
+import prompts as P
+from rag import retrieve
 
-    Priority:
-    1. Streamlit Secrets
-    2. Environment variable
-    """
-
-    # Streamlit Cloud / .streamlit/secrets.toml
-    try:
-        key = st.secrets.get("GEMINI_API_KEY")
-
-        if key:
-            return str(key).strip()
-    except Exception:
-        pass
-
-    # Environment variable
-    key = os.getenv("GEMINI_API_KEY")
-
-    if key:
-        return key.strip()
-
-    return None
-
-
-GEMINI_API_KEY = get_gemini_api_key()
-
-
-if not GEMINI_API_KEY:
-    raise ValueError(
-        "GEMINI_API_KEY is not configured.\n\n"
-        "For Streamlit Cloud, add GEMINI_API_KEY "
-        "under App Settings → Secrets."
-    )
-
-
-# ============================================================
-# GEMINI MODEL
-# ============================================================
-
-try:
-    secret_model = st.secrets.get("GEMINI_MODEL")
-except Exception:
-    secret_model = None
-
-
-GEMINI_MODEL = (
-    os.getenv("GEMINI_MODEL")
-    or secret_model
-    or "gemini-3.8-flash"
-)
-
-
-# ============================================================
-# GEMINI LLM
-# ============================================================
-
-gemini_llm = LLM(
-    model=f"gemini/{GEMINI_MODEL}",
-    api_key=GEMINI_API_KEY,
-)
-
-
-# ============================================================
-# COMMON SETTINGS
-# ============================================================
-
-COMMON_AGENT_SETTINGS = {
-    "llm": gemini_llm,
-    "verbose": True,
+SCORE_WEIGHTS = {
+    "technical_skills": 0.40,
+    "experience": 0.30,
+    "education": 0.10,
+    "keywords_soft_skills": 0.20,
 }
 
 
-# ============================================================
-# 1. MANAGER AGENT
-# ============================================================
-
-manager_agent = Agent(
-    role="Career Operations Manager",
-    goal=(
-        "Understand the user's career request and provide a "
-        "clear, structured career analysis based only on the "
-        "information provided."
-    ),
-    backstory=(
-        "You are an experienced career operations manager. "
-        "You provide practical, structured, and truthful career "
-        "guidance. You never invent information about the "
-        "candidate, job, company, or career history."
-    ),
-    **COMMON_AGENT_SETTINGS,
-    allow_delegation=False,
-)
+class TeamState(TypedDict, total=False):
+    job_analysis: str
+    cv_analysis: str
+    job_evidence: list
+    cv_evidence: list
+    match_score: dict
+    skill_gaps: dict
+    matching: str
+    application: str
+    cover_letter: str
+    roadmap: str
+    review: str
 
 
-# ============================================================
-# 2. JOB ANALYST AGENT
-# ============================================================
-
-job_analyst_agent = Agent(
-    role="Job Description Analyst",
-    goal=(
-        "Analyze the target job description and identify "
-        "requirements, responsibilities, qualifications, "
-        "technical skills, soft skills, experience requirements, "
-        "education requirements, keywords, and preferred "
-        "qualifications."
-    ),
-    backstory=(
-        "You are an expert recruitment and job-description "
-        "analyst. You understand how employers describe roles "
-        "and how applicant tracking systems identify relevant "
-        "skills and keywords. You distinguish between required "
-        "and preferred qualifications and never invent "
-        "requirements."
-    ),
-    **COMMON_AGENT_SETTINGS,
-    allow_delegation=False,
-)
+def _text(response) -> str:
+    content = response.content
+    if isinstance(content, list):
+        return "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
+    return content
 
 
-# ============================================================
-# 3. CV ANALYST AGENT
-# ============================================================
-
-cv_agent = Agent(
-    role="CV and Candidate Matching Specialist",
-    goal=(
-        "Analyze the candidate's CV and compare the candidate's "
-        "skills, education, projects, work experience, "
-        "achievements, certifications, and technical background "
-        "against the target job."
-    ),
-    backstory=(
-        "You are an experienced CV reviewer and recruitment "
-        "specialist. You identify concrete evidence in a "
-        "candidate's background and identify requirements that "
-        "are missing or insufficiently supported. You never "
-        "invent qualifications, experience, achievements, "
-        "or skills."
-    ),
-    **COMMON_AGENT_SETTINGS,
-    allow_delegation=False,
-)
+def _parse_json(raw: str) -> dict | None:
+    raw = re.sub(r"```(?:json)?", "", raw).strip()
+    start, end = raw.find("{"), raw.rfind("}")
+    if start == -1 or end == -1:
+        return None
+    try:
+        return json.loads(raw[start:end + 1])
+    except json.JSONDecodeError:
+        return None
 
 
-# ============================================================
-# 4. RESEARCH AGENT
-# ============================================================
-
-research_agent = Agent(
-    role="Company and Opportunity Research Specialist",
-    goal=(
-        "Analyze the organization and job opportunity using "
-        "the information supplied by the user."
-    ),
-    backstory=(
-        "You are a professional company research analyst. "
-        "You focus on reliable factual information and clearly "
-        "distinguish between supplied information and "
-        "interpretation. You never claim to have performed "
-        "live web research unless a web research tool is "
-        "actually available."
-    ),
-    **COMMON_AGENT_SETTINGS,
-    allow_delegation=False,
-)
+def _clamp(value, low=0, high=100) -> int:
+    try:
+        return max(low, min(high, int(round(float(value)))))
+    except (TypeError, ValueError):
+        return 0
 
 
-# ============================================================
-# 5. APPLICATION AGENT
-# ============================================================
-
-application_agent = Agent(
-    role="Professional Application Specialist",
-    goal=(
-        "Create tailored, professional, and truthful application "
-        "materials using the job description, candidate CV, "
-        "company information, and user's career request."
-    ),
-    backstory=(
-        "You are an expert professional application writer. "
-        "You create targeted professional summaries, CV "
-        "improvement suggestions, cover letters, application "
-        "answers, and application strategies. You never invent "
-        "experience, skills, achievements, qualifications, "
-        "or employment history."
-    ),
-    **COMMON_AGENT_SETTINGS,
-    allow_delegation=False,
-)
+def _fmt(items: list[dict], key: str = "point") -> str:
+    return "\n".join(f"- {i.get(key, '')}" for i in items) or "None identified."
 
 
-# ============================================================
-# 6. INTERVIEW AGENT
-# ============================================================
+class CareerTeam:
+    def __init__(self, llm, vectorstore, options: dict | None = None):
+        self.llm = llm
+        self.vs = vectorstore
+        self.opt = {
+            "tone": "professional and warm",
+            "company": "",
+            "hiring_manager": "",
+            "roadmap_days": 90,
+            "hours_per_week": 8,
+            **(options or {}),
+        }
 
-interview_agent = Agent(
-    role="Interview Preparation Coach",
-    goal=(
-        "Prepare the candidate for the target interview by "
-        "generating job-specific technical, behavioral, "
-        "situational, and role-specific questions together "
-        "with practical preparation guidance."
-    ),
-    backstory=(
-        "You are an experienced interview coach who understands "
-        "technical and behavioral hiring processes. You create "
-        "questions based on the actual job requirements and "
-        "candidate background. You help candidates structure "
-        "strong answers while keeping them truthful."
-    ),
-    **COMMON_AGENT_SETTINGS,
-    allow_delegation=False,
-)
+    # ---------- helpers ----------
+    def _ask(self, prompt: str) -> str:
+        return _text(self.llm.invoke(prompt))
+
+    def _ask_json(self, prompt: str) -> dict:
+        raw = self._ask(prompt)
+        data = _parse_json(raw)
+        if data is None:  # one retry with a stricter nudge
+            raw = self._ask(prompt + "\n\nYour last answer was not valid JSON. Return ONLY the JSON object.")
+            data = _parse_json(raw)
+        return data or {}
+
+    # ---------- agents ----------
+    def job_analyst(self, state: TeamState) -> dict:
+        ctx, ev = retrieve(self.vs, "job title requirements skills responsibilities qualifications",
+                           "JOB_DESCRIPTION", k=6)
+        return {"job_analysis": self._ask(P.fill(P.JOB_ANALYST, CONTEXT=ctx)), "job_evidence": ev}
+
+    def cv_analyst(self, state: TeamState) -> dict:
+        ctx, ev = retrieve(self.vs, "education skills projects experience certifications achievements",
+                           "CV", k=6)
+        return {"cv_analysis": self._ask(P.fill(P.CV_ANALYST, CONTEXT=ctx)), "cv_evidence": ev}
+
+    def _cv_raw(self) -> str:
+        ctx, _ = retrieve(self.vs, "skills tools technologies projects experience", "CV", k=8)
+        return ctx
+
+    def match_score(self, state: TeamState) -> dict:
+        """NEW (CV Analyst): percentage match with reasons."""
+        data = self._ask_json(P.fill(
+            P.MATCH_SCORE,
+            JOB=state["job_analysis"], CV=state["cv_analysis"], CV_RAW=self._cv_raw(),
+        ))
+        breakdown = {k: _clamp(data.get("breakdown", {}).get(k, 0)) for k in SCORE_WEIGHTS}
+        overall = _clamp(sum(breakdown[k] * w for k, w in SCORE_WEIGHTS.items()))
+        return {"match_score": {
+            "overall": overall,
+            "breakdown": breakdown,
+            "verdict": data.get("verdict", "Score could not be fully explained."),
+            "strengths": data.get("strengths", []),
+            "weaknesses": data.get("weaknesses", []),
+        }}
+
+    def skill_gap(self, state: TeamState) -> dict:
+        """NEW (CV Analyst): missing / weak skills for this job."""
+        data = self._ask_json(P.fill(
+            P.SKILL_GAP,
+            JOB=state["job_analysis"], CV=state["cv_analysis"], CV_RAW=self._cv_raw(),
+        ))
+        order = {"Critical": 0, "Important": 1, "Nice-to-have": 2}
+        gaps = sorted(data.get("gaps", []), key=lambda g: order.get(g.get("importance"), 3))
+        return {"skill_gaps": {"gaps": gaps, "strong_skills": data.get("strong_skills", [])}}
+
+    def matching_agent(self, state: TeamState) -> dict:
+        return {"matching": self._ask(P.fill(P.MATCHING, JOB=state["job_analysis"], CV=state["cv_analysis"]))}
+
+    def application_agent(self, state: TeamState) -> dict:
+        """Profile + CV improvements, and NEW: customized cover letter."""
+        gaps = state["skill_gaps"]["gaps"]
+        gap_text = ", ".join(g.get("skill", "") for g in gaps) or "None identified."
+        strengths = _fmt(state["match_score"]["strengths"])
+
+        application = self._ask(P.fill(P.APPLICATION_PROFILE, MATCHING=state["matching"], GAPS=gap_text))
+        cover_letter = self._ask(P.fill(
+            P.COVER_LETTER,
+            JOB=state["job_analysis"], CV=state["cv_analysis"],
+            STRENGTHS=strengths, GAPS=gap_text,
+            COMPANY=self.opt["company"] or "Not provided",
+            MANAGER=self.opt["hiring_manager"] or "Not provided",
+            TONE=self.opt["tone"],
+        ))
+        return {"application": application, "cover_letter": cover_letter}
+
+    def manager_agent(self, state: TeamState) -> dict:
+        """NEW (Manager Agent): learning / career roadmap from all team reports."""
+        gaps = state["skill_gaps"]
+        roadmap = self._ask(P.fill(
+            P.CAREER_ROADMAP,
+            JOB=state["job_analysis"], CV=state["cv_analysis"],
+            SCORE=state["match_score"]["overall"],
+            GAPS=json.dumps(gaps["gaps"], indent=1),
+            STRONG=", ".join(gaps["strong_skills"]) or "None identified.",
+            DAYS=self.opt["roadmap_days"], HOURS=self.opt["hours_per_week"],
+        ))
+        return {"roadmap": roadmap}
+
+    def reviewer(self, state: TeamState) -> dict:
+        return {"review": self._ask(P.fill(
+            P.REVIEWER,
+            CV=state["cv_analysis"], APPLICATION=state["application"],
+            COVER_LETTER=state["cover_letter"], ROADMAP=state["roadmap"],
+        ))}
 
 
-# ============================================================
-# 7. CRITIC AGENT
-# ============================================================
-
-critic_agent = Agent(
-    role="Career Application Quality Reviewer",
-    goal=(
-        "Review the supplied career application information "
-        "and identify missing requirements, weak evidence, "
-        "generic content, inconsistencies, unsupported claims, "
-        "application weaknesses, and interview preparation gaps."
-    ),
-    backstory=(
-        "You are a meticulous quality reviewer for professional "
-        "job applications. You provide specific and actionable "
-        "feedback and never invent facts about the candidate."
-    ),
-    **COMMON_AGENT_SETTINGS,
-    allow_delegation=False,
-    )
-
-
-# ============================================================
-# CONFIGURATION MESSAGE
-# ============================================================
-
-print(
-    f"CareerOps AI Gemini model configured: {GEMINI_MODEL}"
-)
+def build_graph(llm, vectorstore, options: dict | None = None):
+    team = CareerTeam(llm, vectorstore, options)
+    g = StateGraph(TeamState)
+    steps = [
+        ("job_analyst", team.job_analyst),
+        ("cv_analyst", team.cv_analyst),
+        ("match_score", team.match_score),
+        ("skill_gap", team.skill_gap),
+        ("matching_agent", team.matching_agent),
+        ("application_agent", team.application_agent),
+        ("manager_agent", team.manager_agent),
+        ("reviewer", team.reviewer),
+    ]
+    for name, fn in steps:
+        g.add_node(name, fn)
+    g.add_edge(START, steps[0][0])
+    for (a, _), (b, _) in zip(steps, steps[1:]):
+        g.add_edge(a, b)
+    g.add_edge(steps[-1][0], END)
+    return g.compile()
